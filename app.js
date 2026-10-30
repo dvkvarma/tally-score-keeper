@@ -7,8 +7,7 @@ const KEY = 'tally.v1';
 const MAXP = 8;
 const RULES = { requireWinner: true, autoEnd: true };
 
-const def = i => 'Player ' + (i + 1);
-const isDef = s => !s.trim() || /^Player \d+$/.test(s.trim());
+const MAX_SAVED = 100;
 const digits = v => String(v).replace(/\D/g, '').slice(0, 4);
 const eq = (a, b) => a.trim().toLowerCase() === b.trim().toLowerCase();
 const esc = v => String(v).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
@@ -16,7 +15,7 @@ const esc = v => String(v).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;
 // ---------- State & persistence ----------
 
 let state = {
-  screen: 'home', maxStr: '200', names: [0, 1, 2, 3].map(def), focus: null,
+  screen: 'home', maxStr: '200', picked: [], newName: '',
   saved: [], game: null, sheet: null, entry: {}, winner: null, removeId: null,
 };
 
@@ -69,35 +68,73 @@ function setGame(game, extra = {}) {
   setState({ game, sheet: null, ...extra, screen: c && c.over ? 'over' : (extra.screen || 'game') });
 }
 
-function setCount(n) {
-  n = Math.max(2, Math.min(MAXP, n));
-  const names = state.names.slice(0, n);
-  while (names.length < n) names.push(def(names.length));
-  setState({ names });
+// Setup: players are chosen from the saved roster; picked order is seating order.
+function togglePick(name) {
+  const picked = state.picked.filter(n => !eq(n, name));
+  if (picked.length === state.picked.length) {
+    if (picked.length >= MAXP) return;
+    picked.push(name);
+  }
+  setState({ picked });
 }
 
-function tapSaved(name) {
-  const names = state.names.slice();
-  const idx = names.findIndex(n => eq(n, name));
-  if (idx >= 0) names[idx] = def(idx);
-  else {
-    const f = state.focus;
-    const j = f != null && f < names.length && isDef(names[f]) ? f : names.findIndex(isDef);
-    if (j >= 0) names[j] = name;
-    else if (names.length < MAXP) names.push(name);
-  }
-  setState({ names });
+function movePick(from, to) {
+  if (to < 0 || to >= state.picked.length || to === from) return;
+  const picked = state.picked.slice();
+  picked.splice(to, 0, picked.splice(from, 1)[0]);
+  setState({ picked });
+}
+
+function addPlayer() {
+  const name = state.newName.trim().replace(/\s+/g, ' ');
+  if (!name) return;
+  const existing = state.saved.find(s => eq(s, name));
+  const picked = state.picked.slice();
+  if (!picked.some(n => eq(n, existing || name)) && picked.length < MAXP) picked.push(existing || name);
+  const saved = existing ? state.saved : [name, ...state.saved].slice(0, MAX_SAVED);
+  setState({ saved, picked, newName: '' });
 }
 
 function start() {
   const max = parseInt(state.maxStr, 10) || 0;
-  if (max < 1) return;
-  const players = state.names.map((n, i) => ({ id: i, name: n.trim() || def(i) }));
-  let saved = state.saved.slice();
-  players.forEach(p => {
-    if (!isDef(p.name)) { saved = saved.filter(s => !eq(s, p.name)); saved.unshift(p.name); }
-  });
-  setGame({ max, players, rounds: [], ended: false }, { saved: saved.slice(0, 40), screen: 'game' });
+  if (max < 1 || state.picked.length < 2) return;
+  const players = state.picked.map((name, i) => ({ id: i, name }));
+  // Most recently played names float to the top of the roster.
+  const saved = [...state.picked, ...state.saved.filter(s => !state.picked.some(n => eq(n, s)))].slice(0, MAX_SAVED);
+  setGame({ max, players, rounds: [], ended: false }, { saved, screen: 'game' });
+}
+
+// ---------- Announce: read the standings aloud with the browser's speech synthesis ----------
+
+const CAN_SPEAK = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
+let speaking = false;
+let utterance = null;
+
+function announceText(g) {
+  const c = calc(g);
+  const n = g.rounds.length;
+  if (!n) return 'Round 1. No scores yet.';
+  const byTotal = list => list.slice().sort((a, b) => a.total - b.total);
+  const parts = [c.over ? `Final scores after ${n} round${n === 1 ? '' : 's'}.` : `Scores after round ${n}.`];
+  if (c.over) parts.push(`${c.winners.map(w => w.name).join(' and ')} ${c.winners.length > 1 ? 'tie' : 'wins'} with ${c.min}.`);
+  byTotal(c.active).filter(p => !(c.over && c.winners.includes(p))).forEach(p => parts.push(`${p.name}, ${p.total}.`));
+  const out = byTotal(c.ps.filter(p => p.status === 'out'));
+  if (out.length) parts.push('Out: ' + out.map(p => `${p.name}, ${p.total}`).join('. ') + '.');
+  return parts.join(' ');
+}
+
+function announce() {
+  const synth = window.speechSynthesis;
+  synth.cancel();
+  if (speaking) { speaking = false; utterance = null; render(); return; }
+  const u = new SpeechSynthesisUtterance(announceText(state.game));
+  u.rate = 0.95;
+  // cancel() can fire end/error for an earlier utterance late, so only react to the current one.
+  u.onend = u.onerror = () => { if (utterance === u) { speaking = false; utterance = null; render(); } };
+  utterance = u;
+  speaking = true;
+  synth.speak(u);
+  render();
 }
 
 // ---------- Actions (wired via data-click / data-input / data-focus) ----------
@@ -107,7 +144,7 @@ const maxNum = () => parseInt(state.maxStr, 10) || 0;
 
 const actions = {
   goHome: () => setState({ screen: 'home', sheet: null }),
-  goSetup: () => setState({ screen: 'setup', sheet: null, focus: null, names: [0, 1, 2, 3].map(def), maxStr: state.game ? String(state.game.max) : '200' }),
+  goSetup: () => setState({ screen: 'setup', sheet: null, picked: [], newName: '', maxStr: state.game ? String(state.game.max) : '200' }),
   resume: () => setState({ screen: 'game', sheet: null }),
   forget: i => setState({ saved: state.saved.filter((_, k) => k !== num(i)) }),
 
@@ -115,11 +152,10 @@ const actions = {
   maxUp: () => setState({ maxStr: String(maxNum() + 10) }),
   maxDown: () => setState({ maxStr: String(Math.max(10, maxNum() - 10)) }),
   preset: v => setState({ maxStr: String(v) }),
-  countUp: () => setCount(state.names.length + 1),
-  countDown: () => setCount(state.names.length - 1),
-  nameInput: (i, el) => { const names = state.names.slice(); names[num(i)] = el.value; setState({ names }); },
-  nameFocus: (i, el) => { if (isDef(state.names[num(i)] || '')) el.select(); setState({ focus: num(i) }); },
-  tapSaved: i => tapSaved(state.saved[num(i)]),
+  togglePick: i => togglePick(state.saved[num(i)]),
+  unpick: i => setState({ picked: state.picked.filter((_, k) => k !== num(i)) }),
+  newNameInput: (_, el) => setState({ newName: el.value }),
+  addPlayer,
   start,
 
   closeSheet: () => setState({ sheet: null }),
@@ -163,9 +199,14 @@ const actions = {
     const g = state.game;
     setGame({ max: g.max, players: g.players.map(p => ({ id: p.id, name: p.name })), rounds: [], ended: false }, { screen: 'game' });
   },
-  newFromGame: () => setState({ screen: 'setup', focus: null, names: state.game.players.map(p => p.name), maxStr: String(state.game.max) }),
+  newFromGame: () => {
+    const picked = state.game.players.map(p => p.name);
+    const missing = picked.filter(n => !state.saved.some(s => eq(s, n)));
+    setState({ screen: 'setup', picked, newName: '', saved: [...missing, ...state.saved].slice(0, MAX_SAVED), maxStr: String(state.game.max) });
+  },
   backToBoard: () => setState({ screen: 'game' }),
   showResults: () => setState({ screen: 'over' }),
+  announce,
 };
 
 function roundReady(c) {
@@ -209,18 +250,32 @@ function viewHome() {
   </main>`;
 }
 
+const SPEAKER_ICON = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg>';
+const STOP_ICON = '<svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg>';
+const GRIP ='<svg width="12" height="18" viewBox="0 0 12 18" aria-hidden="true"><g fill="currentColor">'
+  + [3, 9, 15].map(y => `<circle cx="3" cy="${y}" r="1.6"/><circle cx="9" cy="${y}" r="1.6"/>`).join('') + '</g></svg>';
+
 function viewSetup() {
   const m = maxNum();
-  const n = state.names.length;
-  const chips = state.saved.length
-    ? `<div class="stack" style="gap:10px;padding-top:4px">
-        <div class="hint">Tap a saved name to add it</div>
-        <div class="chips">${state.saved.map((name, i) => {
-          const used = state.names.some(x => eq(x, name));
-          return `<button class="chip${used ? ' on' : ''}" data-click="tapSaved" data-arg="${i}">${used ? '✓' : '+'} ${esc(name)}</button>`;
-        }).join('')}</div>
-      </div>`
-    : '';
+  const n = state.picked.length;
+  const full = n >= MAXP;
+  // The add row stays first in the list so the morph never replaces its focused input.
+  const roster = state.saved.map((name, i) => {
+    const pos = state.picked.findIndex(x => eq(x, name));
+    const on = pos >= 0;
+    return `<button class="pick-row${on ? ' on' : full ? ' dim' : ''}" data-click="togglePick" data-arg="${i}" aria-pressed="${on}">
+      <span class="ellipsis">${esc(name)}</span>
+      <span class="pick-mark">${on ? '✓' : ''}</span>
+    </button>`;
+  }).join('');
+  const order = state.picked.map((name, i) => `
+    <div class="order-row">
+      <button class="grip" data-drag="${i}" aria-label="Reorder ${esc(name)}, position ${i + 1} of ${n}. Use arrow keys to move.">${GRIP}</button>
+      <div class="no">${i + 1}</div>
+      <div class="n ellipsis">${esc(name)}</div>
+      <button class="mini" data-click="unpick" data-arg="${i}" aria-label="Take ${esc(name)} out">×</button>
+    </div>`).join('');
+  const hint = state.saved.length ? 'Tap to pick who’s playing.' : 'Add at least 2 players to start.';
   return `<main class="screen" data-screen-label="New game">
     <div class="topbar">
       <button class="icon-btn" data-click="goHome" aria-label="Back">←</button>
@@ -239,26 +294,28 @@ function viewSetup() {
         </div>
       </section>
       <section class="stack" style="gap:14px">
-        <div class="row-between" style="align-items:center">
-          <div class="section-title">Players</div>
-          <div class="counter">
-            <button data-click="countDown" aria-label="Fewer players"${n <= 2 ? ' disabled' : ''}>−</button>
-            <div class="val">${n}</div>
-            <button data-click="countUp" aria-label="More players"${n >= MAXP ? ' disabled' : ''}>+</button>
+        <div class="row-between">
+          <div class="section-title">Seating order</div>
+          <div class="small-mono">${n} of ${MAXP} picked</div>
+        </div>
+        <div class="card list">${order || '<div class="order-empty">Pick players below</div>'}</div>
+      </section>
+      <section class="stack" style="gap:14px">
+        <div class="section-title">Players</div>
+        <div class="card list">
+          <div class="add-row">
+            <input data-input="newNameInput" data-enter="addPlayer" value="${esc(state.newName)}" placeholder="Add a new player" aria-label="New player name" autocomplete="off" maxlength="24" enterkeyhint="done">
+            <button class="add-btn" data-click="addPlayer"${state.newName.trim() ? '' : ' disabled'}>Add</button>
           </div>
+          ${roster}
         </div>
-        <div class="card list">${state.names.map((name, i) => `
-          <div class="name-row">
-            <div class="no">${i + 1}</div>
-            <input data-input="nameInput" data-focus="nameFocus" data-arg="${i}" value="${esc(name)}" placeholder="${def(i)}" aria-label="Player ${i + 1} name" autocomplete="off" enterkeyhint="next">
-            <span class="pen" aria-hidden="true">✎</span>
-          </div>`).join('')}
-        </div>
-        ${chips}
+        <div class="hint">${hint}</div>
       </section>
     </div>
     <div class="sticky-cta">
-      <button class="btn btn-red btn-full" data-click="start">Start game</button>
+      ${n >= 2
+        ? `<button class="btn btn-red btn-full" data-click="start">Start game · ${n} players</button>`
+        : `<button class="btn btn-disabled btn-full" disabled>Pick at least 2 players</button>`}
     </div>
   </main>`;
 }
@@ -328,7 +385,10 @@ function viewGame() {
   return `<main class="screen" data-screen-label="Scoreboard">
     <div class="topbar split">
       <button class="icon-btn" data-click="goHome" aria-label="Home">←</button>
-      ${c.over ? '' : '<button class="text-btn" data-click="askEnd">End game</button>'}
+      <div class="topbar-actions">
+        ${CAN_SPEAK ? `<button class="icon-btn speak${speaking ? ' on' : ''}" data-click="announce" aria-label="${speaking ? 'Stop announcing' : 'Announce scores'}" aria-pressed="${speaking}">${speaking ? STOP_ICON : SPEAKER_ICON}</button>` : ''}
+        ${c.over ? '' : '<button class="text-btn" data-click="askEnd">End game</button>'}
+      </div>
     </div>
     <div class="round-head">
       <h1 class="round-title">${c.over ? 'Final' : 'Round ' + roundNo}</h1>
@@ -480,6 +540,7 @@ const root = document.getElementById('app');
 let lastScreen = null;
 
 function render() {
+  if (speaking && state.screen !== 'game') { window.speechSynthesis.cancel(); speaking = false; utterance = null; }
   const tpl = document.createElement('template');
   tpl.innerHTML = view();
   morph(root, tpl.content);
@@ -506,6 +567,7 @@ root.addEventListener('focusin', e => {
 });
 root.addEventListener('keydown', e => {
   if (e.key !== 'Enter' || e.target.tagName !== 'INPUT') return;
+  if (e.target.dataset.enter) { e.preventDefault(); actions[e.target.dataset.enter](); return; }
   // Enter moves to the next input, or saves the round / starts the game from the last one.
   const inputs = Array.from(root.querySelectorAll(state.sheet ? '.sheet input' : 'input'));
   const next = inputs[inputs.indexOf(e.target) + 1];
@@ -514,6 +576,56 @@ root.addEventListener('keydown', e => {
   else if (state.sheet === 'round') actions.saveRound();
   else if (state.screen === 'setup') start();
 });
+
+// Drag to reorder the seating list. Rows move with inline transforms during the drag;
+// state is only updated on drop, so the morph never runs mid-gesture.
+let drag = null;
+root.addEventListener('pointerdown', e => {
+  const grip = e.target.closest('[data-drag]');
+  if (!grip || e.button > 0) return;
+  e.preventDefault();
+  const row = grip.closest('.order-row');
+  const rows = Array.from(row.parentNode.querySelectorAll('.order-row'));
+  const from = rows.indexOf(row);
+  drag = { id: e.pointerId, row, rows, from, to: from, startY: e.clientY, h: row.getBoundingClientRect().height };
+  grip.setPointerCapture(e.pointerId);
+  row.parentNode.classList.add('sorting');
+  row.classList.add('dragging');
+});
+root.addEventListener('pointermove', e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  const { rows, from, h } = drag;
+  const dy = Math.max(-from * h, Math.min((rows.length - 1 - from) * h, e.clientY - drag.startY));
+  const to = from + Math.round(dy / h);
+  drag.to = to;
+  drag.row.style.transform = `translateY(${dy}px)`;
+  rows.forEach((r, i) => {
+    if (i === from) return;
+    const shift = i > from && i <= to ? -h : i < from && i >= to ? h : 0;
+    r.style.transform = shift ? `translateY(${shift}px)` : '';
+  });
+});
+function endDrag(e) {
+  if (!drag || e.pointerId !== drag.id) return;
+  const { rows, row, from, to } = drag;
+  drag = null;
+  row.parentNode.classList.remove('sorting');
+  rows.forEach(r => { r.style.transform = ''; r.classList.remove('dragging'); });
+  movePick(from, to);
+}
+root.addEventListener('pointerup', endDrag);
+root.addEventListener('pointercancel', endDrag);
+root.addEventListener('keydown', e => {
+  const grip = e.target.closest('[data-drag]');
+  if (!grip || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+  e.preventDefault();
+  const from = num(grip.dataset.drag);
+  const to = from + (e.key === 'ArrowUp' ? -1 : 1);
+  movePick(from, to);
+  const moved = root.querySelector(`[data-drag="${Math.max(0, Math.min(state.picked.length - 1, to))}"]`);
+  if (moved) moved.focus();
+});
+
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && state.sheet) actions.closeSheet();
 });
